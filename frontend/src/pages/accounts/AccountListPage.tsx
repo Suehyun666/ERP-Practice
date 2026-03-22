@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, ToggleLeft, ToggleRight, ChevronDown, ChevronUp } from 'lucide-react';
+import { Plus, ChevronDown, ChevronUp } from 'lucide-react';
 import { useAccounts } from '../../hooks/useAccounts';
 import { PageHeader } from '../../components/common/PageHeader';
 import { AccountTable } from './AccountTable';
