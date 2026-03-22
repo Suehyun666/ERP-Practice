@@ -16,8 +16,10 @@ public class WebMvcConfig implements WebMvcConfigurer {
     public void addCorsMappings(CorsRegistry registry) {
         registry.addMapping("/api/**")
                 .allowedOrigins(
-                        "http://localhost:5173",   // Vite dev server
-                        "http://localhost:3000"    // 배포 시 프론트 주소 추가 가능
+                        "http://localhost:5173",
+                        "http://localhost:3000",
+                        "http://em0200878.shop",
+                        "https://em0200878.shop"
                 )
                 .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
