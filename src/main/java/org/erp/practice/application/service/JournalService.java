@@ -52,6 +52,7 @@ public class JournalService implements JournalUseCase {
         }
 
         journalRepository.updateStatus(journalId, "POSTED", approverId);
+        journalRepository.applyToAccountBalances(journalId);
         return journalRepository.findById(journalId).orElseThrow();
     }
 

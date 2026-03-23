@@ -11,5 +11,6 @@ public interface JournalRepository {
     Optional<JournalResponse> findById(Long journalId);
     List<JournalResponse> findByFiscalPeriod(int year, int month);
     void updateStatus(Long journalId, String status, Long userId);
+    void applyToAccountBalances(Long journalId);
     String generateJournalNo(int year, int month);
 }

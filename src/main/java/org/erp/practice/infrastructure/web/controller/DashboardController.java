@@ -73,35 +73,46 @@ public class DashboardController {
                 MonthTrend.builder().month(month)
                         .revenue(BigDecimal.ZERO).expenses(BigDecimal.ZERO).netIncome(BigDecimal.ZERO).build());
 
-        // 현금 잔액 (누적 — 해당 월까지)
-        BigDecimal cashBalance = nvl(dsl.select(sum(field("ab.closing_balance", BigDecimal.class)))
+        // 현금 및 외상매출금 잔액 (누적 — 1 query)
+        var balanceRows = dsl.select(
+                        field("ab.account_code"),
+                        sum(field("ab.closing_balance", BigDecimal.class)).as("balance"))
                 .from(table("account_balances").as("ab"))
-                .where(field("ab.account_code").in("110101", "110102", "110103"))
+                .where(field("ab.account_code").in("110101", "110102", "110103", "110201", "110202"))
                 .and(field("ab.fiscal_year").le(year))
                 .and(field("ab.fiscal_year").lt(year)
                         .or(field("ab.fiscal_month").le(month)))
-                .fetchOneInto(BigDecimal.class), BigDecimal.ZERO);
+                .groupBy(field("ab.account_code"))
+                .fetch();
 
-        // 외상매출금 잔액 (누적)
-        BigDecimal arBalance = nvl(dsl.select(sum(field("ab.closing_balance", BigDecimal.class)))
-                .from(table("account_balances").as("ab"))
-                .where(field("ab.account_code").in("110201", "110202"))
-                .and(field("ab.fiscal_year").le(year))
-                .and(field("ab.fiscal_year").lt(year)
-                        .or(field("ab.fiscal_month").le(month)))
-                .fetchOneInto(BigDecimal.class), BigDecimal.ZERO);
+        Map<String, BigDecimal> balanceMap = balanceRows.stream()
+                .collect(Collectors.toMap(
+                        r -> r.get(field("ab.account_code"), String.class),
+                        r -> nvl(r.get("balance", BigDecimal.class), BigDecimal.ZERO)
+                ));
+        BigDecimal cashBalance = List.of("110101", "110102", "110103").stream()
+                .map(c -> balanceMap.getOrDefault(c, BigDecimal.ZERO))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal arBalance = List.of("110201", "110202").stream()
+                .map(c -> balanceMap.getOrDefault(c, BigDecimal.ZERO))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // 전표 건수
-        long draftCount  = nvl(dsl.selectCount().from(table("journal_headers"))
+        // 전표 건수 (DRAFT / POSTED) 한번에 조회 (1 query)
+        var countRows = dsl.select(field("status"), count().as("cnt"))
+                .from(table("journal_headers"))
                 .where(field("fiscal_year").eq((short) year))
                 .and(field("fiscal_month").eq((byte) month))
-                .and(field("status").eq("DRAFT"))
-                .fetchOneInto(Long.class), 0L);
-        long postedCount = nvl(dsl.selectCount().from(table("journal_headers"))
-                .where(field("fiscal_year").eq((short) year))
-                .and(field("fiscal_month").eq((byte) month))
-                .and(field("status").eq("POSTED"))
-                .fetchOneInto(Long.class), 0L);
+                .and(field("status").in("DRAFT", "POSTED"))
+                .groupBy(field("status"))
+                .fetch();
+
+        Map<String, Long> countMap = countRows.stream()
+                .collect(Collectors.toMap(
+                        r -> r.get(field("status"), String.class),
+                        r -> r.get(field("cnt"), Long.class)
+                ));
+        long draftCount  = countMap.getOrDefault("DRAFT",  0L);
+        long postedCount = countMap.getOrDefault("POSTED", 0L);
 
         // ── 비용 상위 항목 ─────────────────────────────────────────────
         var expRows = dsl.select(field("coa.account_name"), sum(field("ab.debit_total", BigDecimal.class)).as("total"))

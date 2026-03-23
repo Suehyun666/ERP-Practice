@@ -10,8 +10,10 @@ import org.springframework.stereotype.Repository;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import static org.jooq.impl.DSL.field;
 import static org.jooq.impl.DSL.table;
@@ -112,14 +114,69 @@ public class JooqJournalRepository implements JournalRepository {
 
     @Override
     public List<JournalResponse> findByFiscalPeriod(int year, int month) {
-        return dsl.select(field("journal_id"))
+        // 1. 헤더 목록 조회 (1 query)
+        var headers = dsl.select()
                 .from(table("journal_headers"))
                 .where(field("fiscal_year").eq((short) year))
                 .and(field("fiscal_month").eq((byte) month))
                 .orderBy(field("journal_no"))
-                .fetch(field("journal_id"), Long.class)
+                .fetch();
+
+        if (headers.isEmpty()) return List.of();
+
+        List<Long> journalIds = headers.getValues(field("journal_id"), Long.class);
+
+        // 2. 해당 기간 전표의 모든 라인 한번에 조회 (1 query, IN 절)
+        Map<Long, List<JournalResponse.LineResponse>> linesMap = dsl
+                .select(
+                        field("jl.journal_id"),
+                        field("jl.line_id"),
+                        field("jl.line_no"),
+                        field("jl.account_code"),
+                        field("coa.account_name"),
+                        field("jl.account_side"),
+                        field("jl.amount"),
+                        field("jl.currency"),
+                        field("jl.description")
+                )
+                .from(table("journal_lines").as("jl"))
+                .join(table("chart_of_accounts").as("coa"))
+                    .on(field("jl.account_code").eq(field("coa.account_code")))
+                .where(field("jl.journal_id").in(journalIds))
+                .orderBy(field("jl.journal_id"), field("jl.line_no"))
+                .fetch()
                 .stream()
-                .map(id -> findById(id).orElseThrow())
+                .collect(Collectors.groupingBy(
+                        r -> r.get(field("jl.journal_id"), Long.class),
+                        Collectors.mapping(r -> JournalResponse.LineResponse.builder()
+                                .lineId(r.get(field("jl.line_id"), Long.class))
+                                .lineNo(r.get(field("jl.line_no"), Integer.class))
+                                .accountCode(r.get(field("jl.account_code"), String.class))
+                                .accountName(r.get(field("coa.account_name"), String.class))
+                                .accountSide(r.get(field("jl.account_side"), String.class))
+                                .amount(r.get(field("jl.amount"), java.math.BigDecimal.class))
+                                .currency(r.get(field("jl.currency"), String.class))
+                                .description(r.get(field("jl.description"), String.class))
+                                .build(),
+                                Collectors.toList())
+                ));
+
+        // 3. 헤더 + 라인 조합 (in-memory)
+        return headers.stream()
+                .map(r -> {
+                    Long id = r.get(field("journal_id"), Long.class);
+                    return JournalResponse.builder()
+                            .journalId(id)
+                            .journalNo(r.get(field("journal_no"), String.class))
+                            .docDate(r.get(field("doc_date"), java.time.LocalDate.class))
+                            .postDate(r.get(field("post_date"), java.time.LocalDate.class))
+                            .status(r.get(field("status"), String.class))
+                            .description(r.get(field("description"), String.class))
+                            .createdBy(r.get(field("created_by"), Long.class))
+                            .createdAt(r.get(field("created_at"), LocalDateTime.class))
+                            .lines(linesMap.getOrDefault(id, List.of()))
+                            .build();
+                })
                 .toList();
     }
 
@@ -131,23 +188,23 @@ public class JooqJournalRepository implements JournalRepository {
         if ("POSTED".equals(status)) {
             update = update.set(field("posted_by"), userId)
                            .set(field("posted_at"), LocalDateTime.now());
-            update.where(field("journal_id").eq(journalId)).execute();
-            applyToAccountBalances(journalId); // 승인 시 잔액 스냅샷 반영
         } else if ("CANCELLED".equals(status)) {
             update = update.set(field("cancelled_by"), userId)
                            .set(field("cancelled_at"), LocalDateTime.now());
-            update.where(field("journal_id").eq(journalId)).execute();
-            // 취소 시엔 역전표가 별도로 POSTED되므로 잔액 조작 불필요
-        } else {
-            update.where(field("journal_id").eq(journalId)).execute();
         }
+        update.where(field("journal_id").eq(journalId)).execute();
+        // 잔액 반영은 JournalService에서 명시적으로 호출
     }
 
     /**
-     * 전표 승인 시 account_balances 스냅샷 갱신
-     * journal_lines는 건드리지 않고 집계 테이블만 업데이트
+     * 전표 승인 시 account_balances 스냅샷 갱신.
+     * chart_of_accounts.normal_side 기준으로 closing_balance 증감 방향 결정:
+     *   - DEBIT 정상 계정(자산·비용): 차변 발생 시 +, 대변 발생 시 -
+     *   - CREDIT 정상 계정(부채·자본·수익): 대변 발생 시 +, 차변 발생 시 -
+     * 라인 전체를 한 번에 조회 후 jOOQ batch로 벌크 처리.
      */
-    private void applyToAccountBalances(Long journalId) {
+    @Override
+    public void applyToAccountBalances(Long journalId) {
         Record header = dsl.select(field("fiscal_year"), field("fiscal_month"))
                 .from(table("journal_headers"))
                 .where(field("journal_id").eq(journalId))
@@ -157,30 +214,46 @@ public class JooqJournalRepository implements JournalRepository {
         short year  = header.get(field("fiscal_year"),  Short.class);
         byte  month = header.get(field("fiscal_month"), Byte.class);
 
-        dsl.select(field("account_code"), field("account_side"), field("amount"))
-                .from(table("journal_lines"))
-                .where(field("journal_id").eq(journalId))
-                .fetch()
-                .forEach(line -> {
-                    String     code   = line.get(field("account_code"), String.class);
-                    boolean    isDebit = "DEBIT".equals(line.get(field("account_side"), String.class));
-                    java.math.BigDecimal amount = line.get(field("amount"), java.math.BigDecimal.class);
+        // normal_side 포함해서 한번에 조회
+        var lines = dsl.select(
+                        field("jl.account_code"),
+                        field("jl.account_side"),
+                        field("jl.amount"),
+                        field("coa.normal_side"))
+                .from(table("journal_lines").as("jl"))
+                .join(table("chart_of_accounts").as("coa"))
+                    .on(field("jl.account_code").eq(field("coa.account_code")))
+                .where(field("jl.journal_id").eq(journalId))
+                .fetch();
 
-                    dsl.query("""
-                        INSERT INTO account_balances
-                            (account_code, fiscal_year, fiscal_month, currency, debit_total, credit_total, closing_balance)
-                        VALUES (?, ?, ?, 'KRW', ?, ?, ?)
-                        ON DUPLICATE KEY UPDATE
-                            debit_total     = debit_total  + VALUES(debit_total),
-                            credit_total    = credit_total + VALUES(credit_total),
-                            closing_balance = closing_balance + VALUES(closing_balance)
-                        """,
-                        code, year, month,
-                        isDebit  ? amount : java.math.BigDecimal.ZERO,
-                        !isDebit ? amount : java.math.BigDecimal.ZERO,
-                        isDebit  ? amount : amount.negate()
-                    ).execute();
-                });
+        if (lines.isEmpty()) return;
+
+        var batchQueries = lines.stream().map(line -> {
+            String  code          = line.get(field("jl.account_code"),   String.class);
+            boolean isDebit       = "DEBIT".equals(line.get(field("jl.account_side"), String.class));
+            boolean isDebitNormal = "DEBIT".equals(line.get(field("coa.normal_side"), String.class));
+            java.math.BigDecimal amount = line.get(field("jl.amount"), java.math.BigDecimal.class);
+
+            // closing_balance 증감: 입력 방향이 normal_side와 같으면 +, 반대면 -
+            java.math.BigDecimal balanceDelta = (isDebit == isDebitNormal) ? amount : amount.negate();
+
+            return dsl.query("""
+                INSERT INTO account_balances
+                    (account_code, fiscal_year, fiscal_month, currency, debit_total, credit_total, closing_balance)
+                VALUES (?, ?, ?, 'KRW', ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    debit_total     = debit_total  + VALUES(debit_total),
+                    credit_total    = credit_total + VALUES(credit_total),
+                    closing_balance = closing_balance + VALUES(closing_balance)
+                """,
+                code, year, month,
+                isDebit  ? amount : java.math.BigDecimal.ZERO,
+                !isDebit ? amount : java.math.BigDecimal.ZERO,
+                balanceDelta
+            );
+        }).toList();
+
+        dsl.batch(batchQueries).execute();
     }
 
     @Override
