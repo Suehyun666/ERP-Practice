@@ -76,8 +76,9 @@ public class JournalService implements JournalUseCase {
         JournalCreateRequest reversal = buildReversalRequest(original);
         JournalResponse reversalDraft = journalRepository.save(reversal, userId);
 
-        // 역전표 바로 승인
+        // 역전표 바로 승인 + 잔액 반영
         journalRepository.updateStatus(reversalDraft.getJournalId(), "POSTED", userId);
+        journalRepository.applyToAccountBalances(reversalDraft.getJournalId());
 
         // 원본 전표 CANCELLED 처리
         journalRepository.updateStatus(journalId, "CANCELLED", userId);
